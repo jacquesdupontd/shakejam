@@ -212,6 +212,7 @@ const INSTRUMENTS = [
 let ctx=null, mode='';
 let current=INSTRUMENTS[0], motionOk=false, invert=false;
 let audioReady=false, shakeCount=0, lastErr='', wkOut=0;
+let motionEvents=0, lastMag=0;
 const isIOS = typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function';
 const accelSign = isIOS ? 1 : -1;   // l'accéléromètre iOS est inversé vs Android
 
@@ -220,9 +221,8 @@ try{ (0,eval)(document.getElementById('dsp-core').textContent); }catch(e){ lastE
 
 function dbg(){
   const el=document.getElementById('dbg'); if(!el) return;
-  el.textContent = `audio: ${ctx?ctx.state:'—'} · moteur: ${mode||'—'} · out:${wkOut.toFixed(2)} · ♪${shakeCount}`
+  el.textContent = `son:${mode||'—'} · capteur:${motionOk?(motionEvents+'ev/'+lastMag.toFixed(1)):'off'} · ♪${shakeCount}`
     + (lastErr?(' · ⚠ '+lastErr):'');
-  const eb=document.getElementById('engineBtn'); if(eb) eb.textContent='moteur: '+(mode||'—');
 }
 
 // ── Déblocage audio SYNCHRONE (dans le geste — clé sur mobile/iOS) ───────
@@ -369,21 +369,28 @@ let gx=0,gy=0,gz=0,gInit=false, armed=true, lastShake=0, threshold=12;
 const maxLinear=42;
 function applySensitivity(s){ threshold = 22 - s*16; }
 function onMotion(e){
-  const a=e.accelerationIncludingGravity; if(!a) return;
+  motionEvents++;
+  let a=e.accelerationIncludingGravity, hasGrav=true;
+  if(!a || (a.x==null && a.y==null && a.z==null)){ a=e.acceleration; hasGrav=false; }
+  if(!a || (a.x==null && a.y==null && a.z==null)){ lastErr='accel null'; if(motionEvents%10===0)dbg(); return; }
+  if(lastErr==='accel null') lastErr='';
   const vx=a.x||0, vy=a.y||0, vz=a.z||0;
-  if(!gInit){ gx=vx; gy=vy; gz=vz; gInit=true; return; }
-  const al=0.82;
-  gx=al*gx+(1-al)*vx; gy=al*gy+(1-al)*vy; gz=al*gz+(1-al)*vz;
-  const lx=vx-gx, ly=vy-gy, lz=vz-gz;
-  const mag=Math.sqrt(lx*lx+ly*ly+lz*lz);
+  if(hasGrav){
+    if(!gInit){ gx=vx; gy=vy; gz=vz; gInit=true; return; }
+    const al=0.82; gx=al*gx+(1-al)*vx; gy=al*gy+(1-al)*vy; gz=al*gz+(1-al)*vz;
+  }
+  const lx=vx-(hasGrav?gx:0), ly=vy-(hasGrav?gy:0), lz=vz-(hasGrav?gz:0);
+  const gmag=hasGrav ? (Math.sqrt(gx*gx+gy*gy+gz*gz)||9.81) : 9.81;
+  const unit=9.81/gmag;                          // -> m/s² même si valeurs en g
+  const mag=Math.sqrt(lx*lx+ly*ly+lz*lz)*unit;
+  lastMag=mag;
   document.getElementById('meterFill').style.width = Math.min(100, mag/maxLinear*100)+'%';
 
-  const gmag=Math.sqrt(gx*gx+gy*gy+gz*gz)||9.81;
-  let lat = accelSign*gx/gmag; if(lat<-1)lat=-1; else if(lat>1)lat=1;
-  if(invert) lat=-lat;
-  tiltTarget = lat;
-  stageSetTilt(lat);
-
+  if(hasGrav){
+    let lat = accelSign*gx/gmag; if(lat<-1)lat=-1; else if(lat>1)lat=1;
+    if(invert) lat=-lat;
+    tiltTarget = lat; stageSetTilt(lat);
+  }
   const now=performance.now();
   if(armed && mag>=threshold && now-lastShake>=60){
     armed=false; lastShake=now;
@@ -391,6 +398,7 @@ function onMotion(e){
     intensity=Math.max(0.12, Math.min(1, intensity));
     doShake(intensity);
   } else if(!armed && mag<threshold*0.55){ armed=true; }
+  if(motionEvents%10===0) dbg();
 }
 
 // ── Vue animée (= InstrumentStageView.kt) ───────────────────────────────
