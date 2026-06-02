@@ -64,9 +64,14 @@
     background:linear-gradient(135deg,var(--accent2),var(--accent)); border:none; border-radius:30px;
     box-shadow:0 8px 30px rgba(255,138,61,.45);}
   .big{font-size:54px;}
+  #rotate{display:none; position:fixed; inset:0; background:var(--bg-bot); z-index:20;
+    flex-direction:column; align-items:center; justify-content:center; gap:14px;
+    text-align:center; padding:24px; color:var(--dim);}
+  @media (orientation:landscape){ #rotate{display:flex;} }
 </style>
 </head>
 <body>
+  <div id="rotate"><div class="big">🔄</div><p>Tourne ton téléphone en <b>portrait</b></p></div>
   <button class="invert" id="invertBtn">⇄ sens</button>
   <div class="toprow">
     <button class="tbtn" id="testBtn">🔊 test son</button>
@@ -370,7 +375,7 @@ const maxLinear=42;
 let accelActive=false;                 // l'accéléromètre fournit-il des données ?
 // secousse via orientation (fallback quand accelerationIncludingGravity est null)
 let orientEvents=0, lastGamma=0, armedO=true, lastShakeO=0, prevBeta=null, prevGamma=null, prevOriT=0, orientThresh=240;
-function applySensitivity(s){ threshold = 22 - s*16; orientThresh = 420 - s*320; }
+function applySensitivity(s){ threshold = 18 - s*13; orientThresh = 380 - s*300; }
 // Coeur du traitement accéléromètre (gravité incluse, m/s² ou g) : inclinaison
 // (glissement) + secousse. Alimenté par devicemotion OU le Generic Sensor API.
 function feedAccel(vx,vy,vz){
@@ -397,14 +402,14 @@ function feedAccel(vx,vy,vz){
 
 // Generic Sensor API (Chrome Android) : souvent fiable quand devicemotion ne
 // diffuse pas. Donne x/y/z en m/s² (gravité incluse).
-let genEvents=0, genSensor=null;
+let genEvents=0, genSensor=null, genActive=false;
 function startGenericSensors(){
   try{
     if(typeof Accelerometer!=='undefined'){
       genSensor=new Accelerometer({frequency:60});
-      genSensor.addEventListener('reading', function(){ genEvents++; feedAccel(genSensor.x, genSensor.y, genSensor.z); if(genEvents%10===0)dbg(); });
+      genSensor.addEventListener('reading', function(){ genEvents++; genActive=true; feedAccel(genSensor.x, genSensor.y, genSensor.z); if(genEvents%10===0)dbg(); });
       genSensor.addEventListener('error', function(ev){ const nm=(ev.error&&ev.error.name)||'?'; lastErr='gs:'+nm;
-        if(nm==='NotAllowedError') document.getElementById('tagline').textContent='Capteurs bloqués → cadenas barre d\\'adresse → Autorisations → Capteurs : Autoriser, puis recharge';
+        if(nm==='NotAllowedError') document.getElementById('tagline').textContent='Capteurs bloqués : cadenas → Autorisations → Capteurs de mouvement : Autoriser, puis recharge';
         dbg(); });
       genSensor.start();
       return true;
@@ -415,6 +420,7 @@ function startGenericSensors(){
 
 function onMotion(e){
   motionEvents++;
+  if(genActive){ if(motionEvents%20===0)dbg(); return; }   // Generic Sensor prioritaire
   let a=e.accelerationIncludingGravity;
   if(!a || (a.x==null && a.y==null && a.z==null)){ a=e.acceleration; }
   if(!a || (a.x==null && a.y==null && a.z==null)){ if(motionEvents%10===0)dbg(); return; }
@@ -426,10 +432,13 @@ function onMotion(e){
 // vitesse angulaire -> secousse. Marche quand l'accéléromètre est muet.
 function onOrient(e){
   orientEvents++;
+  // si l'accéléromètre (devicemotion ou Generic Sensor) gère déjà, on ne touche
+  // à RIEN — éviter que deux sources se battent (= mouvement incohérent).
+  if(accelActive || genActive){ if(orientEvents%20===0)dbg(); return; }
   if(e.gamma==null && e.beta==null){ if(orientEvents%10===0)dbg(); return; }
   const gamma=e.gamma||0, beta=e.beta||0;
   lastGamma=gamma;
-  // inclinaison latérale -> glissement (toujours, c'est la source la plus fiable)
+  // inclinaison latérale -> glissement
   let lat=gamma/45; if(lat<-1)lat=-1; else if(lat>1)lat=1;
   if(invert) lat=-lat;
   tiltTarget=lat; stageSetTilt(lat);
@@ -564,8 +573,18 @@ function buildCards(){
 }
 
 // ── Démarrage (geste utilisateur obligatoire iOS) ───────────────────────
+function lockPortrait(){
+  try{
+    const el=document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    const lock = function(){ try{ if(screen.orientation && screen.orientation.lock) screen.orientation.lock('portrait').catch(function(){}); }catch(e){} };
+    if(req){ Promise.resolve(req.call(el)).then(lock).catch(lock); } else { lock(); }
+  }catch(e){}
+}
+
 document.getElementById('startBtn').addEventListener('click', async function(){
   unlockAudioSync();                       // 1) débloquer l'audio DANS le geste
+  lockPortrait();                          // plein écran + verrou portrait (dans le geste)
   try{
     if(isIOS){ const res=await DeviceMotionEvent.requestPermission(); motionOk=(res==='granted'); }
     else motionOk=true;
