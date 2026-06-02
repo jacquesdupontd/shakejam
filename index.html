@@ -51,6 +51,11 @@
   .invert{position:absolute; top:10px; right:14px; font-size:12px; color:var(--dim);
     background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12);
     border-radius:14px; padding:6px 10px;}
+  .toprow{position:absolute; top:10px; left:14px; display:flex; gap:8px;}
+  .tbtn{font-size:12px; color:var(--dim); background:rgba(255,255,255,.06);
+    border:1px solid rgba(255,255,255,.12); border-radius:14px; padding:6px 10px;}
+  #dbg{position:absolute; left:0; right:0; bottom:0; font:11px/1.4 ui-monospace,monospace;
+    color:#7de08a; background:rgba(0,0,0,.45); padding:4px 10px; text-align:center;}
   #overlay{position:fixed; inset:0; background:rgba(6,5,13,.94); display:flex;
     flex-direction:column; align-items:center; justify-content:center; gap:18px; z-index:10; text-align:center; padding:24px;}
   #overlay h2{margin:0; font-size:24px;}
@@ -63,6 +68,7 @@
 </head>
 <body>
   <button class="invert" id="invertBtn">⇄ sens</button>
+  <div class="toprow"><button class="tbtn" id="testBtn">🔊 test son</button></div>
   <header>
     <h1>ShakeJam</h1>
     <div class="tagline" id="tagline">Penche pour faire glisser · secoue pour jouer</div>
@@ -80,6 +86,7 @@
   </div>
 
   <div class="cards" id="cards"></div>
+  <div id="dbg">audio: —</div>
 
   <div id="overlay">
     <div class="big">🪘</div>
@@ -200,12 +207,32 @@ const INSTRUMENTS = [
 
 // ── État ────────────────────────────────────────────────────────────────
 let ctx=null, node=null, current=INSTRUMENTS[0], motionOk=false, invert=false;
+let audioReady=false, shakeCount=0, lastErr='';
 const isIOS = typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function';
 const accelSign = isIOS ? 1 : -1;   // l'accéléromètre iOS est inversé vs Android
 
-// ── Audio (AudioWorklet) ────────────────────────────────────────────────
-async function initAudio(){
-  ctx = new (window.AudioContext||window.webkitAudioContext)();
+function dbg(){
+  const el=document.getElementById('dbg'); if(!el) return;
+  el.textContent = `audio: ${ctx?ctx.state:'—'} · worklet: ${node?'ok':'ko'} · ♪${shakeCount}`
+    + (lastErr?(' · ⚠ '+lastErr):'');
+}
+
+// ── Déblocage audio SYNCHRONE (dans le geste — clé sur mobile/iOS) ───────
+function unlockAudioSync(){
+  if(!ctx){
+    try{ ctx = new (window.AudioContext||window.webkitAudioContext)(); }
+    catch(e){ lastErr='ctx:'+e.message; dbg(); return; }
+  }
+  // buffer muet : débloque la sortie audio iOS/Android dans le geste
+  try{ const b=ctx.createBuffer(1,1,22050); const s=ctx.createBufferSource();
+       s.buffer=b; s.connect(ctx.destination); s.start(0); }catch(e){}
+  ctx.resume().catch(()=>{});
+  dbg();
+}
+
+// ── Chargement de l'AudioWorklet (après déblocage) ──────────────────────
+async function loadWorklet(){
+  if(audioReady) return;
   const coreSrc = document.getElementById('dsp-core').textContent;
   const glue = `
     class KayambProcessor extends AudioWorkletProcessor {
@@ -235,7 +262,26 @@ async function initAudio(){
   node.connect(ctx.destination);
   setInstrument(current);
   node.parameters.get('reverb').value = parseFloat(document.getElementById('rev').value);
+  audioReady=true;
   await ctx.resume();
+  dbg();
+}
+
+// bip de test : oscillateur direct (sans worklet) -> isole le souci device vs worklet
+function testBeep(){
+  unlockAudioSync();
+  if(!ctx){ return; }
+  ctx.resume().catch(()=>{});
+  try{
+    const o=ctx.createOscillator(), g=ctx.createGain();
+    o.frequency.value=440; o.type='sine';
+    g.gain.setValueAtTime(0.001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime+0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.45);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime+0.5);
+  }catch(e){ lastErr='beep:'+e.message; }
+  dbg();
 }
 
 function setInstrument(inst){
@@ -249,9 +295,12 @@ function setInstrument(inst){
   buildCards();
 }
 function doShake(intensity){
-  if(node) node.port.postMessage({type:'shake', v:intensity});
+  if(ctx && ctx.state!=='running') ctx.resume().catch(()=>{});
+  if(node){ node.port.postMessage({type:'shake', v:intensity}); shakeCount++; }
+  else lastErr='node null';
   stageBurst(intensity);
   if(navigator.vibrate) navigator.vibrate(14);
+  dbg();
 }
 
 // ── Capteur de mouvement (= ShakeDetector.kt) ───────────────────────────
@@ -390,19 +439,25 @@ function buildCards(){
 
 // ── Démarrage (geste utilisateur obligatoire iOS) ───────────────────────
 document.getElementById('startBtn').addEventListener('click', async function(){
+  unlockAudioSync();                       // 1) débloquer l'audio DANS le geste
   try{
     if(isIOS){ const res=await DeviceMotionEvent.requestPermission(); motionOk=(res==='granted'); }
     else motionOk=true;
-  }catch(err){ motionOk=false; }
-  try{ await initAudio(); }
-  catch(err){ document.getElementById('tagline').textContent='Audio indisponible : '+err.message; }
+  }catch(err){ motionOk=false; lastErr='perm:'+err.message; }
+  try{ await loadWorklet(); }              // 2) charger le worklet (audio déjà débloqué)
+  catch(err){ lastErr='wk:'+err.message; document.getElementById('tagline').textContent='Audio: '+err.message; }
   if(motionOk) window.addEventListener('devicemotion', onMotion, true);
   else document.getElementById('tagline').textContent='Capteur refusé — touche le disque pour jouer';
   document.getElementById('overlay').style.display='none';
+  dbg();
 });
 
+// filet de sécurité : tout toucher relance le contexte s'il s'est suspendu
+window.addEventListener('pointerdown', function(){ if(ctx && ctx.state!=='running') ctx.resume().catch(()=>{}); }, true);
+document.getElementById('testBtn').addEventListener('click', testBeep);
+
 // touche le disque = secousse (test / sans capteur)
-canvas.addEventListener('pointerdown', function(){ if(ctx) doShake(0.7); });
+canvas.addEventListener('pointerdown', function(){ unlockAudioSync(); doShake(0.7); });
 document.getElementById('sens').addEventListener('input', function(e){ applySensitivity(parseFloat(e.target.value)); });
 document.getElementById('rev').addEventListener('input', function(e){ if(node) node.parameters.get('reverb').value=parseFloat(e.target.value); });
 document.getElementById('invertBtn').addEventListener('click', function(){ invert=!invert;
@@ -410,6 +465,7 @@ document.getElementById('invertBtn').addEventListener('click', function(){ inver
 
 // init
 resize(); buildCards(); applySensitivity(0.55); lastFrame=performance.now(); requestAnimationFrame(frame);
+dbg(); setInterval(dbg, 500);
 </script>
 </body>
 </html>
