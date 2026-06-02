@@ -68,7 +68,10 @@
 </head>
 <body>
   <button class="invert" id="invertBtn">⇄ sens</button>
-  <div class="toprow"><button class="tbtn" id="testBtn">🔊 test son</button></div>
+  <div class="toprow">
+    <button class="tbtn" id="testBtn">🔊 test son</button>
+    <button class="tbtn" id="engineBtn">moteur</button>
+  </div>
   <header>
     <h1>ShakeJam</h1>
     <div class="tagline" id="tagline">Penche pour faire glisser · secoue pour jouer</div>
@@ -208,7 +211,7 @@ const INSTRUMENTS = [
 // ── État ────────────────────────────────────────────────────────────────
 let ctx=null, node=null, mode='', mainDsp=null;
 let current=INSTRUMENTS[0], motionOk=false, invert=false;
-let audioReady=false, shakeCount=0, lastErr='';
+let audioReady=false, shakeCount=0, lastErr='', wkOut=0, wkOutPeak=0, workletAdded=false;
 const isIOS = typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function';
 const accelSign = isIOS ? 1 : -1;   // l'accéléromètre iOS est inversé vs Android
 
@@ -217,8 +220,9 @@ try{ (0,eval)(document.getElementById('dsp-core').textContent); }catch(e){ lastE
 
 function dbg(){
   const el=document.getElementById('dbg'); if(!el) return;
-  el.textContent = `audio: ${ctx?ctx.state:'—'} · moteur: ${mode||'—'} · ♪${shakeCount}`
+  el.textContent = `audio: ${ctx?ctx.state:'—'} · moteur: ${mode||'—'} · out:${wkOut.toFixed(2)} · ♪${shakeCount}`
     + (lastErr?(' · ⚠ '+lastErr):'');
+  const eb=document.getElementById('engineBtn'); if(eb) eb.textContent='moteur: '+(mode||'—');
 }
 
 // ── Déblocage audio SYNCHRONE (dans le geste — clé sur mobile/iOS) ───────
@@ -234,46 +238,66 @@ function unlockAudioSync(){
   dbg();
 }
 
-// ── Démarrage du moteur : AudioWorklet si possible, sinon ScriptProcessor ─
-async function startAudioEngine(){
-  if(audioReady) return;
-  // 1) tentative AudioWorklet (off-main-thread, idéal)
-  if(ctx.audioWorklet){
+// ── Moteur audio reconstructible (worklet ou ScriptProcessor) ───────────
+function teardownEngine(){
+  try{ if(node){ if(mode==='script') node.onaudioprocess=null; node.disconnect(); } }catch(e){}
+  node=null; mainDsp=null; mode=''; wkOut=0;
+}
+
+async function addWorkletModule(){
+  if(workletAdded) return;
+  const coreSrc = document.getElementById('dsp-core').textContent;
+  const glue = `
+    class KayambProcessor extends AudioWorkletProcessor {
+      static get parameterDescriptors(){return [
+        {name:'tilt',defaultValue:0,minValue:-1,maxValue:1,automationRate:'k-rate'},
+        {name:'reverb',defaultValue:0.18,minValue:0,maxValue:1,automationRate:'k-rate'},
+      ];}
+      constructor(){ super(); this.dsp=createKayambDSP(sampleRate); this.mx=0; this.cnt=0;
+        this.port.onmessage=(e)=>{const d=e.data;
+          if(d.type==='spec') this.dsp.setSpec(d.spec);
+          else if(d.type==='shake') this.dsp.shake(d.v);}; }
+      process(inputs,outputs,params){
+        const out=outputs[0]; const L=out[0], R=out[1]||out[0];
+        this.dsp.setTilt(params.tilt[0]);
+        this.dsp.setReverb(params.reverb[0]*0.45);
+        this.dsp.render(L,R,L.length);
+        for(let i=0;i<L.length;i+=16){const a=Math.abs(L[i]); if(a>this.mx)this.mx=a;}
+        if(++this.cnt>=12){ this.port.postMessage({type:'out', v:this.mx}); this.mx=0; this.cnt=0; }
+        return true;
+      }
+    }
+    registerProcessor('kayamb-processor', KayambProcessor);`;
+  const url = URL.createObjectURL(new Blob([coreSrc+'\n'+glue], {type:'application/javascript'}));
+  await ctx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+  workletAdded=true;
+}
+
+// want: 'auto' | 'worklet' | 'script'
+async function buildEngine(want){
+  teardownEngine();
+  if((want==='auto'||want==='worklet') && ctx.audioWorklet){
     try{
-      const coreSrc = document.getElementById('dsp-core').textContent;
-      const glue = `
-        class KayambProcessor extends AudioWorkletProcessor {
-          static get parameterDescriptors(){return [
-            {name:'tilt',defaultValue:0,minValue:-1,maxValue:1,automationRate:'k-rate'},
-            {name:'reverb',defaultValue:0.18,minValue:0,maxValue:1,automationRate:'k-rate'},
-          ];}
-          constructor(){ super(); this.dsp=createKayambDSP(sampleRate);
-            this.port.onmessage=(e)=>{const d=e.data;
-              if(d.type==='spec') this.dsp.setSpec(d.spec);
-              else if(d.type==='shake') this.dsp.shake(d.v);}; }
-          process(inputs,outputs,params){
-            const out=outputs[0]; const L=out[0], R=out[1]||out[0];
-            this.dsp.setTilt(params.tilt[0]);
-            this.dsp.setReverb(params.reverb[0]*0.45);
-            this.dsp.render(L,R,L.length); return true;
-          }
-        }
-        registerProcessor('kayamb-processor', KayambProcessor);`;
-      const url = URL.createObjectURL(new Blob([coreSrc+'\n'+glue], {type:'application/javascript'}));
-      await ctx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+      await addWorkletModule();
       node = new AudioWorkletNode(ctx,'kayamb-processor',{numberOfInputs:0, outputChannelCount:[2]});
+      node.port.onmessage = (e)=>{ if(e.data && e.data.type==='out'){ wkOut=e.data.v; if(wkOut>wkOutPeak)wkOutPeak=wkOut; } };
       node.connect(ctx.destination);
       mode='worklet';
     }catch(e){ lastErr='wk:'+e.message; node=null; }
   }
-  // 2) fallback ScriptProcessor (même DSP, thread principal — marche partout)
-  if(!node){
+  if(!node){  // ScriptProcessor (forcé, ou fallback) — marche partout
     if(typeof createKayambDSP!=='function'){ lastErr='dsp absent'; dbg(); return; }
     mainDsp = createKayambDSP(ctx.sampleRate);
-    const sp = ctx.createScriptProcessor(1024, 0, 2);
+    // 1 canal d'entrée (inutilisé) : certains navigateurs ne déclenchent pas
+    // onaudioprocess avec 0 entrée. Connecté à une source muette pour être "tiré".
+    const sp = ctx.createScriptProcessor(1024, 1, 2);
+    const silent = ctx.createConstantSource(); silent.offset.value=0;
+    silent.connect(sp);
+    try{ silent.start(); }catch(e){}
     sp.onaudioprocess = function(ev){
-      const ob=ev.outputBuffer;
-      mainDsp.render(ob.getChannelData(0), ob.getChannelData(1), ob.length);
+      const ob=ev.outputBuffer, L=ob.getChannelData(0), R=ob.getChannelData(1);
+      mainDsp.render(L, R, ob.length);
+      let m=0; for(let i=0;i<L.length;i+=16){const a=Math.abs(L[i]); if(a>m)m=a;} wkOut=m; if(m>wkOutPeak)wkOutPeak=m;
     };
     sp.connect(ctx.destination);
     node = sp; mode='script';
@@ -286,10 +310,10 @@ async function startAudioEngine(){
 }
 
 // routage paramètres -> worklet (message/param) ou DSP principal (direct)
-function synthShake(v){ if(mode==='worklet') node.port.postMessage({type:'shake', v:v}); else if(mainDsp) mainDsp.shake(v); }
-function synthTilt(v){ if(mode==='worklet') node.parameters.get('tilt').value=v; else if(mainDsp) mainDsp.setTilt(v); }
-function synthReverb(v){ if(mode==='worklet') node.parameters.get('reverb').value=v; else if(mainDsp) mainDsp.setReverb(v*0.45); }
-function synthSpec(s){ if(mode==='worklet') node.port.postMessage({type:'spec', spec:s}); else if(mainDsp) mainDsp.setSpec(s); }
+function synthShake(v){ if(mode==='worklet'&&node) node.port.postMessage({type:'shake', v:v}); else if(mainDsp) mainDsp.shake(v); }
+function synthTilt(v){ if(mode==='worklet'&&node) node.parameters.get('tilt').value=v; else if(mainDsp) mainDsp.setTilt(v); }
+function synthReverb(v){ if(mode==='worklet'&&node) node.parameters.get('reverb').value=v; else if(mainDsp) mainDsp.setReverb(v*0.45); }
+function synthSpec(s){ if(mode==='worklet'&&node) node.port.postMessage({type:'spec', spec:s}); else if(mainDsp) mainDsp.setSpec(s); }
 
 // bip de test : oscillateur direct (sans worklet) -> isole le souci device vs worklet
 function testBeep(){
@@ -468,7 +492,9 @@ document.getElementById('startBtn').addEventListener('click', async function(){
     if(isIOS){ const res=await DeviceMotionEvent.requestPermission(); motionOk=(res==='granted'); }
     else motionOk=true;
   }catch(err){ motionOk=false; lastErr='perm:'+err.message; }
-  try{ await startAudioEngine(); }         // 2) moteur audio (worklet ou fallback)
+  // 2) moteur audio : ScriptProcessor par défaut (universel, se comporte comme
+  //    le bip qui marche). Le worklet (latence moindre) reste dispo via le bouton.
+  try{ await buildEngine('script'); }
   catch(err){ lastErr='eng:'+err.message; document.getElementById('tagline').textContent='Audio: '+err.message; }
   if(motionOk) window.addEventListener('devicemotion', onMotion, true);
   else document.getElementById('tagline').textContent='Capteur refusé — touche le disque pour jouer';
@@ -479,6 +505,13 @@ document.getElementById('startBtn').addEventListener('click', async function(){
 // filet de sécurité : tout toucher relance le contexte s'il s'est suspendu
 window.addEventListener('pointerdown', function(){ if(ctx && ctx.state!=='running') ctx.resume().catch(()=>{}); }, true);
 document.getElementById('testBtn').addEventListener('click', testBeep);
+// bouton moteur : bascule worklet <-> script (pour trouver le chemin qui sonne)
+document.getElementById('engineBtn').addEventListener('click', async function(){
+  if(!ctx){ unlockAudioSync(); }
+  if(!ctx) return;
+  await buildEngine(mode==='worklet' ? 'script' : 'worklet');
+  doShake(0.6);
+});
 
 // touche le disque = secousse (test / sans capteur)
 canvas.addEventListener('pointerdown', function(){ unlockAudioSync(); doShake(0.7); });
