@@ -403,7 +403,9 @@ function startGenericSensors(){
     if(typeof Accelerometer!=='undefined'){
       genSensor=new Accelerometer({frequency:60});
       genSensor.addEventListener('reading', function(){ genEvents++; feedAccel(genSensor.x, genSensor.y, genSensor.z); if(genEvents%10===0)dbg(); });
-      genSensor.addEventListener('error', function(ev){ lastErr='gs:'+((ev.error&&ev.error.name)||'?'); dbg(); });
+      genSensor.addEventListener('error', function(ev){ const nm=(ev.error&&ev.error.name)||'?'; lastErr='gs:'+nm;
+        if(nm==='NotAllowedError') document.getElementById('tagline').textContent='Capteurs bloqués → cadenas barre d\\'adresse → Autorisations → Capteurs : Autoriser, puis recharge';
+        dbg(); });
       genSensor.start();
       return true;
     }
