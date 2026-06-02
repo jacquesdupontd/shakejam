@@ -221,7 +221,7 @@ try{ (0,eval)(document.getElementById('dsp-core').textContent); }catch(e){ lastE
 
 function dbg(){
   const el=document.getElementById('dbg'); if(!el) return;
-  el.textContent = `son:${mode||'—'} · cap m${motionEvents}/o${orientEvents} mag${lastMag.toFixed(1)} g${lastGamma.toFixed(0)} · ♪${shakeCount}`
+  el.textContent = `son:${mode||'—'} · cap ${motionEvents}m/${orientEvents}o/${genEvents}s mag${lastMag.toFixed(1)} t${tiltTarget.toFixed(2)} · ♪${shakeCount}`
     + (lastErr?(' · ⚠ '+lastErr):'');
 }
 
@@ -371,29 +371,21 @@ let accelActive=false;                 // l'accéléromètre fournit-il des donn
 // secousse via orientation (fallback quand accelerationIncludingGravity est null)
 let orientEvents=0, lastGamma=0, armedO=true, lastShakeO=0, prevBeta=null, prevGamma=null, prevOriT=0, orientThresh=240;
 function applySensitivity(s){ threshold = 22 - s*16; orientThresh = 420 - s*320; }
-function onMotion(e){
-  motionEvents++;
-  let a=e.accelerationIncludingGravity, hasGrav=true;
-  if(!a || (a.x==null && a.y==null && a.z==null)){ a=e.acceleration; hasGrav=false; }
-  if(!a || (a.x==null && a.y==null && a.z==null)){ if(motionEvents%10===0)dbg(); return; }
+// Coeur du traitement accéléromètre (gravité incluse, m/s² ou g) : inclinaison
+// (glissement) + secousse. Alimenté par devicemotion OU le Generic Sensor API.
+function feedAccel(vx,vy,vz){
   accelActive=true; if(lastErr==='accel null') lastErr='';
-  const vx=a.x||0, vy=a.y||0, vz=a.z||0;
-  if(hasGrav){
-    if(!gInit){ gx=vx; gy=vy; gz=vz; gInit=true; return; }
-    const al=0.82; gx=al*gx+(1-al)*vx; gy=al*gy+(1-al)*vy; gz=al*gz+(1-al)*vz;
-  }
-  const lx=vx-(hasGrav?gx:0), ly=vy-(hasGrav?gy:0), lz=vz-(hasGrav?gz:0);
-  const gmag=hasGrav ? (Math.sqrt(gx*gx+gy*gy+gz*gz)||9.81) : 9.81;
+  if(!gInit){ gx=vx; gy=vy; gz=vz; gInit=true; return; }
+  const al=0.82; gx=al*gx+(1-al)*vx; gy=al*gy+(1-al)*vy; gz=al*gz+(1-al)*vz;
+  const lx=vx-gx, ly=vy-gy, lz=vz-gz;
+  const gmag=Math.sqrt(gx*gx+gy*gy+gz*gz)||9.81;
   const unit=9.81/gmag;                          // -> m/s² même si valeurs en g
   const mag=Math.sqrt(lx*lx+ly*ly+lz*lz)*unit;
   lastMag=mag;
   document.getElementById('meterFill').style.width = Math.min(100, mag/maxLinear*100)+'%';
-
-  if(hasGrav){
-    let lat = accelSign*gx/gmag; if(lat<-1)lat=-1; else if(lat>1)lat=1;
-    if(invert) lat=-lat;
-    tiltTarget = lat; stageSetTilt(lat);
-  }
+  let lat = accelSign*gx/gmag; if(lat<-1)lat=-1; else if(lat>1)lat=1;
+  if(invert) lat=-lat;
+  tiltTarget = lat; stageSetTilt(lat);
   const now=performance.now();
   if(armed && mag>=threshold && now-lastShake>=60){
     armed=false; lastShake=now;
@@ -401,6 +393,30 @@ function onMotion(e){
     intensity=Math.max(0.12, Math.min(1, intensity));
     doShake(intensity);
   } else if(!armed && mag<threshold*0.55){ armed=true; }
+}
+
+// Generic Sensor API (Chrome Android) : souvent fiable quand devicemotion ne
+// diffuse pas. Donne x/y/z en m/s² (gravité incluse).
+let genEvents=0, genSensor=null;
+function startGenericSensors(){
+  try{
+    if(typeof Accelerometer!=='undefined'){
+      genSensor=new Accelerometer({frequency:60});
+      genSensor.addEventListener('reading', function(){ genEvents++; feedAccel(genSensor.x, genSensor.y, genSensor.z); if(genEvents%10===0)dbg(); });
+      genSensor.addEventListener('error', function(ev){ lastErr='gs:'+((ev.error&&ev.error.name)||'?'); dbg(); });
+      genSensor.start();
+      return true;
+    }
+  }catch(e){ lastErr='gs:'+e.message; }
+  return false;
+}
+
+function onMotion(e){
+  motionEvents++;
+  let a=e.accelerationIncludingGravity;
+  if(!a || (a.x==null && a.y==null && a.z==null)){ a=e.acceleration; }
+  if(!a || (a.x==null && a.y==null && a.z==null)){ if(motionEvents%10===0)dbg(); return; }
+  feedAccel(a.x||0, a.y||0, a.z||0);
   if(motionEvents%10===0) dbg();
 }
 
@@ -557,7 +573,8 @@ document.getElementById('startBtn').addEventListener('click', async function(){
   // 2) moteur audio par AudioBufferSource (comme le bip — marche partout)
   try{ await startAudio(); }
   catch(err){ lastErr='eng:'+err.message; document.getElementById('tagline').textContent='Audio: '+err.message; }
-  // on écoute LES DEUX capteurs : accéléromètre ET orientation (fallback)
+  // 3 sources tentées en parallèle (celle qui diffuse gagne) :
+  startGenericSensors();                                  // Generic Sensor API (Android)
   window.addEventListener('devicemotion', onMotion, true);
   window.addEventListener('deviceorientation', onOrient, true);
   if(!motionOk) document.getElementById('tagline').textContent='Astuce : penche/secoue, ou touche le disque';
